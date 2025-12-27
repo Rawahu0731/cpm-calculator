@@ -1,9 +1,9 @@
 import { useState, useRef, useEffect } from 'react';
-import type { User } from 'firebase/auth';
-import { auth, signInWithEmail, signUpWithEmail, signOutUser, onAuthStateChanged, uploadEntriesForUser, fetchEntriesForUser, deleteEntryForUser, clearEntriesForUser } from './firebase';
+import { useNavigate } from 'react-router-dom';
 import './App.css'
 
 function App() {
+  const navigate = useNavigate();
   const [time, setTime] = useState('00:00');
   const [coins, setCoins] = useState(0);
   const [result, setResult] = useState<number | null>(null);
@@ -16,9 +16,7 @@ function App() {
   const [character, setCharacter] = useState('');
   const [skill, setSkill] = useState(1);
   const [entries, setEntries] = useState<Array<{character: string; skill: number; cpm: number; ts: number}>>([]);
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [user, setUser] = useState<any>(null);
+  const [importError, setImportError] = useState<string | null>(null);
   const [isOpening, setIsOpening] = useState(false);
 
   const handleCalcClick = () => {
@@ -28,6 +26,8 @@ function App() {
     const totalMinutes = minutes + (seconds / 60);
     let lastCoins = coins;
 
+    if(coin) lastCoins = lastCoins * 1.3;
+
     if (score) lastCoins -=500;
     if (coin) lastCoins -=500;
     if (exp) lastCoins -=500;
@@ -36,7 +36,6 @@ function App() {
     if (fivetofour) lastCoins -=1800;
 
     setResult( lastCoins / totalMinutes);
-    if (coin) setResult( lastCoins * 1.3 / totalMinutes);
   }
 
   // Load saved entries from localStorage on mount
@@ -49,36 +48,7 @@ function App() {
     }
   }, []);
 
-  // Firebase auth state listener — ログイン時にサーバーデータを取得してローカルとマージ
-  useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (u: User | null) => {
-      setUser(u ?? null);
-      if (u) {
-        (async () => {
-          try {
-            const serverEntries = await fetchEntriesForUser(u);
-            // ローカルの保存データを取得してマージ（tsで一意化）
-            let local: Array<{character:string; skill:number; cpm:number; ts:number}> = [];
-            try {
-              const raw = localStorage.getItem('cpm_entries');
-              if (raw) local = JSON.parse(raw);
-            } catch (e) { console.error('failed to parse local entries', e); }
-
-            const map = new Map<number, {character:string; skill:number; cpm:number; ts:number}>();
-            // server優先で同tsのものは上書きされる
-            serverEntries.forEach((e) => map.set(e.ts, e));
-            local.forEach((e) => { if (!map.has(e.ts)) map.set(e.ts, e); });
-            const merged = Array.from(map.values()).sort((a,b) => b.ts - a.ts);
-            setEntries(merged);
-            try { localStorage.setItem('cpm_entries', JSON.stringify(merged)); } catch (e) { console.error('failed to save merged entries', e); }
-          } catch (err) {
-            console.error('failed to fetch server entries', err);
-          }
-        })();
-      }
-    });
-    return () => unsubscribe();
-  }, []);
+  // no-op: removed Firebase auth/server sync — app now uses only localStorage + JSON import/export
 
   // aggregated ranking (character+skill) for reuse in UI
   const aggregated = (() => {
@@ -111,18 +81,8 @@ function App() {
     }
   }
 
-  const handleDeleteEntry = async (ts: number) => {
+  const handleDeleteEntry = (ts: number) => {
     if (!window.confirm('この保存エントリを削除しますか？')) return;
-    // If logged in, delete from server as well
-    if (user) {
-      try {
-        await deleteEntryForUser(user, ts);
-      } catch (e) {
-        console.error('failed to delete server entry', e);
-        window.alert('サーバー上の削除に失敗しました：' + (e as any)?.message);
-        return;
-      }
-    }
     const next = entries.filter(e => e.ts !== ts);
     setEntries(next);
     saveEntriesToStorage(next);
@@ -143,65 +103,66 @@ function App() {
     saveEntriesToStorage(next);
   }
 
-  // Authentication handlers
-  const handleSignUp = async () => {
-    try {
-      await signUpWithEmail(email, password);
-      window.alert('サインアップ成功。ログインしてください。');
-    } catch (e: any) {
-      console.error(e);
-      window.alert('サインアップ失敗：' + (e?.message || e));
-    }
-  }
 
-  const handleSignIn = async () => {
+  // Export entries as JSON file
+  const handleExportJSON = () => {
     try {
-      const cred = await signInWithEmail(email, password);
-      const u = cred.user;
-      setUser(u);
-      // Upload local entries to Firestore after sign in
-      if (entries.length > 0) {
-        try {
-          await uploadEntriesForUser(u, entries);
-          if (window.confirm('ローカルの保存データをFirestoreにアップロードしました。ローカルのデータを削除しますか？')) {
-            setEntries([]);
-            localStorage.removeItem('cpm_entries');
-          }
-        } catch (err) {
-          console.error('upload failed', err);
-          window.alert('アップロードに失敗しました：' + (err as any)?.message);
-        }
-      }
-    } catch (e: any) {
-      console.error(e);
-      window.alert('サインイン失敗：' + (e?.message || e));
-    }
-  }
-
-  const handleSignOut = async () => {
-    try {
-      await signOutUser();
-      setUser(null);
+      const blob = new Blob([JSON.stringify(entries, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `cpm_entries_${new Date().toISOString().slice(0,10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
     } catch (e) {
-      console.error(e);
+      console.error('export failed', e);
+      window.alert('エクスポートに失敗しました');
     }
   }
 
-  const handleClearAll = async () => {
-    if (!window.confirm('保存データを全て削除しますか？')) return;
-    // If logged in, clear server data first
-    if (user) {
-      try {
-        await clearEntriesForUser(user);
-      } catch (e) {
-        console.error('failed to clear server entries', e);
-        window.alert('サーバー上の削除に失敗しました：' + (e as any)?.message);
-        return;
-      }
-    }
-    setEntries([]);
-    localStorage.removeItem('cpm_entries');
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const handleImportClick = () => {
+    setImportError(null);
+    fileInputRef.current?.click();
   }
+
+  const handleFileChange = async (e: any) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      if (!Array.isArray(parsed)) throw new Error('JSONは配列である必要があります');
+      // validate items and normalize
+      const items: Array<{character:string; skill:number; cpm:number; ts:number}> = [];
+      parsed.forEach((it: any) => {
+        if (!it || typeof it !== 'object') return;
+        const character = String(it.character || '');
+        const skill = Number(it.skill || 1);
+        const cpm = Number(it.cpm || 0);
+        const ts = Number(it.ts || Date.now());
+        items.push({ character, skill, cpm, ts });
+      });
+      // merge by ts (import overwrites local duplicates)
+      const map = new Map<number, {character:string; skill:number; cpm:number; ts:number}>();
+      entries.forEach(e => map.set(e.ts, e));
+      items.forEach(i => map.set(i.ts, i));
+      const merged = Array.from(map.values()).sort((a,b) => b.ts - a.ts);
+      setEntries(merged);
+      saveEntriesToStorage(merged);
+      setImportError(null);
+      window.alert('インポート完了');
+    } catch (err: any) {
+      console.error('import failed', err);
+      setImportError(err?.message || String(err));
+      window.alert('インポートに失敗しました：' + (err?.message || err));
+    } finally {
+      // clear input
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  }
+
 
   function handleApply(stopwatchTime: string) {
     setTime(stopwatchTime);
@@ -210,30 +171,17 @@ function App() {
   return (
     <>
       <h1>一分効率計算機</h1>
+      <nav style={{ marginBottom: 8, display: 'flex', gap: 8, alignItems: 'center' }}>
+        <button onClick={() => navigate('/usage')}>使い方</button>
+      </nav>
       <div style={{ border: '1px solid #ddd', padding: 8, marginBottom: 12 }}>
-        {user ? (
-          <div>
-            <div>ログイン中: {user.email}</div>
-            <button onClick={handleSignOut}>サインアウト</button>
-            <button onClick={async () => {
-              try {
-                await uploadEntriesForUser(user, entries);
-                window.alert('アップロード完了');
-              } catch (e: any) {
-                console.error(e);
-                window.alert('アップロード失敗：' + (e?.message || e));
-              }
-            }}>Firestoreにアップロード</button>
-          </div>
-        ) : (
-          <div>
-            <input placeholder='email' value={email} onChange={e => setEmail(e.target.value)} />
-            <input placeholder='password' type='password' value={password} onChange={e => setPassword(e.target.value)} />
-            <button onClick={handleSignIn}>サインイン</button>
-            <button onClick={handleSignUp}>サインアップ</button>
-          </div>
-        )}
-        <div style={{ marginTop: 6 }}>ローカル保存数: {entries.length}</div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <button onClick={handleExportJSON}>保存データをJSONでダウンロード</button>
+          <button onClick={handleImportClick}>JSONをインポート</button>
+          <input ref={fileInputRef} type="file" accept="application/json" style={{ display: 'none' }} onChange={handleFileChange} />
+          <div style={{ marginLeft: 'auto' }}>ローカル保存数: {entries.length}</div>
+        </div>
+        {importError && <div style={{ color: 'red', marginTop: 6 }}>インポートエラー: {importError}</div>}
       </div>
       <Stopwatch onApply={handleApply} />
       <div className="input-area">
@@ -277,7 +225,7 @@ function App() {
           <h2>結果</h2>
           <p>一分効率：{result !== null ? result : '???'}コイン/分</p>
           <p>一時間効率：{result !== null ? result * 60 : '???'}コイン/時</p>
-          <p><button onClick={handleSave}>保存</button> <button onClick={handleClearAll}>全削除</button></p>
+          <p><button onClick={handleSave}>保存</button></p>
         </>
         }
       </div>
